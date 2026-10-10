@@ -3,3 +3,5 @@ rpms/
 debs/
 __pycache__/
 *.pyc
+*.rpm
+*.deb
