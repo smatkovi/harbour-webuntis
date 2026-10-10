@@ -1,0 +1,5 @@
+# Baustücke, die am Release hängen
+rpms/
+debs/
+__pycache__/
+*.pyc

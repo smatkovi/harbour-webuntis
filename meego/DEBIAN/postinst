@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+# Das x-Bit steckt im Paket selbst - chmod scheitert hier an aegis
+# ("Operation not permitted"), darum nicht mehr nachtraeglich setzen.
+
+if [ -x /usr/bin/gtk-update-icon-cache ]; then
+    gtk-update-icon-cache -f /usr/share/icons/hicolor || true
+fi
+
+exit 0

@@ -1,0 +1,1240 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+"""
+WebUntis for MeeGo Harmattan PR1.3
+Ported from Sailfish OS harbour-webuntis v3.60-secret
+
+All features from Sailfish version:
+- Timetable (own + for class/teacher/room)
+- Period details with students
+- Absences (create, delete, edit)
+- Lateness
+- Lesson topics
+- Homework
+- Class register events
+- Notes (all/staff)
+"""
+
+import sys
+import os
+import json
+import subprocess
+import threading
+from datetime import datetime, timedelta
+
+reload(sys)
+sys.setdefaultencoding('utf-8')
+
+from PySide.QtCore import QObject, QUrl, Slot, Signal, Property, QTimer
+from PySide.QtGui import QApplication
+from PySide.QtDeclarative import QDeclarativeView
+
+import re
+import urlparse
+import hmac
+import hashlib
+import struct
+import base64
+import time
+
+VERSION = "1.5.3"
+HTTP_HELPER = "/opt/webuntis/http_helper.py"
+CONFIG_DIR = os.path.expanduser("~/.config/webuntis")
+CREDENTIALS_FILE = os.path.join(CONFIG_DIR, "credentials.json")
+AVATAR_CACHE_DIR = os.path.expanduser("~/.cache/webuntis/avatars")
+
+
+def ensure_config_dir():
+    if not os.path.exists(CONFIG_DIR):
+        os.makedirs(CONFIG_DIR)
+
+
+def ensure_avatar_dir():
+    if not os.path.exists(AVATAR_CACHE_DIR):
+        os.makedirs(AVATAR_CACHE_DIR)
+
+
+def generate_otp(secret_b32):
+    """Generate TOTP code from secret"""
+    secret_padded = secret_b32.upper() + '=' * (-len(secret_b32) % 8)
+    secret_bytes = base64.b32decode(secret_padded)
+    counter = int(time.time()) // 30
+    counter_bytes = struct.pack('>Q', counter)
+    hmac_hash = hmac.new(secret_bytes, counter_bytes, hashlib.sha1).digest()
+    offset = ord(hmac_hash[-1]) & 0x0F
+    code = struct.unpack('>I', hmac_hash[offset:offset+4])[0]
+    code = (code & 0x7FFFFFFF) % 1000000
+    return str(code).zfill(6)
+
+
+class WebUntisBackend(QObject):
+    """Backend für WebUntis - portiert von Sailfish OS"""
+    
+    # Signals
+    loginSuccess = Signal(unicode)
+    loginFailed = Signal(unicode)
+    loggedOut = Signal()
+    schoolsFound = Signal(unicode)
+    timetableReady = Signal(unicode)
+    periodDataReady = Signal(unicode)
+    operationResult = Signal(unicode)
+    classesReady = Signal(unicode)
+    teachersReady = Signal(unicode)
+    roomsReady = Signal(unicode)
+    studentsReady = Signal(unicode)
+    homeworkReady = Signal(unicode)
+    notesDataReady = Signal(unicode)
+    homeworkDataReady = Signal(unicode)
+    classRegDataReady = Signal(unicode)
+    
+    def __init__(self, parent=None):
+        super(WebUntisBackend, self).__init__(parent)
+        self._server = ""
+        self._school = ""
+        self._username = ""
+        self._secret = ""
+        self._user_id = None
+        self._user_type = "TEACHER"
+        self._logged_in = False
+        self._avatar_loading = set()  # Track which avatars are being loaded
+        self._cache = {
+            'teachers': {},
+            'subjects': {},
+            'rooms': {},
+            'classes': {},
+            'students': {},
+            'absence_reasons': [],
+            'event_reasons': [],
+            'default_absence_reason_id': None,
+            'default_lateness_reason_id': None,
+        }
+    
+    def _log(self, msg):
+        print u"[WebUntis] %s" % msg
+    
+    def _http_request(self, method, url, data=None, headers=None, timeout=30):
+        """HTTP request via Python 3.11 helper"""
+        try:
+            data_str = json.dumps(data) if data else ""
+            headers_str = json.dumps(headers) if headers else "{}"
+            
+            cmd = [HTTP_HELPER, method, url, data_str, headers_str, str(timeout)]
+            env = os.environ.copy()
+            env['PYTHONIOENCODING'] = 'utf-8'
+            
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+            out, err = proc.communicate()
+            
+            if isinstance(out, str):
+                out = out.decode('utf-8')
+            
+            return json.loads(out)
+        except Exception as e:
+            self._log(u"HTTP error: %s" % unicode(e))
+            return {'error': unicode(e)}
+    
+    def _mobile_call(self, method, extra_params=None):
+        """Call WebUntis Mobile API (jsonrpc_intern.do) with TOTP auth"""
+        if not self._secret or not self._username:
+            return {'error': {'message': 'Nicht authentifiziert'}}
+        
+        otp = generate_otp(self._secret)
+        client_time = int(time.time() * 1000)
+        
+        params = {
+            "auth": {
+                "user": self._username,
+                "otp": int(otp),
+                "clientTime": client_time
+            }
+        }
+        
+        if extra_params:
+            params.update(extra_params)
+        
+        payload = {
+            "id": "1",
+            "method": method,
+            "params": [params],
+            "jsonrpc": "2.0"
+        }
+        
+        url = "https://%s/WebUntis/jsonrpc_intern.do?school=%s" % (self._server, self._school)
+        return self._http_request("POST", url, payload, {"Content-Type": "application/json"})
+    
+    def _jsonrpc_call(self, method, params):
+        """Call standard WebUntis API (jsonrpc.do) - for timetable"""
+        payload = {
+            "id": "1",
+            "method": method,
+            "params": params,
+            "jsonrpc": "2.0"
+        }
+        
+        url = "https://%s/WebUntis/jsonrpc.do?school=%s" % (self._server, self._school)
+        return self._http_request("POST", url, payload, {"Content-Type": "application/json"})
+    
+    # ==================== Credentials ====================
+    
+    def _save_credentials(self):
+        try:
+            ensure_config_dir()
+            data = {
+                'server': self._server,
+                'school': self._school,
+                'username': self._username,
+                'secret': self._secret
+            }
+            with open(CREDENTIALS_FILE, 'w') as f:
+                json.dump(data, f)
+            self._log(u"Credentials saved")
+            return True
+        except Exception as e:
+            self._log(u"Save credentials error: %s" % e)
+            return False
+    
+    def _load_credentials(self):
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                with open(CREDENTIALS_FILE, 'r') as f:
+                    data = json.load(f)
+                self._server = data.get('server', '')
+                self._school = data.get('school', '')
+                self._username = data.get('username', '')
+                self._secret = data.get('secret', '')
+                return bool(self._server and self._school and self._username and self._secret)
+        except Exception as e:
+            self._log(u"Load credentials error: %s" % e)
+        return False
+    
+    def _delete_credentials(self):
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                os.remove(CREDENTIALS_FILE)
+        except:
+            pass
+    
+    def _process_user_data(self, user_data):
+        """Process getUserData2017 and populate cache"""
+        inner = user_data.get("userData", {})
+        if inner:
+            self._user_id = inner.get("elemId")
+            elem_type = inner.get("elemType", "TEACHER")
+            
+            if isinstance(elem_type, (str, unicode)):
+                self._user_type = elem_type.upper()
+            else:
+                type_map = {1: "CLASS", 2: "TEACHER", 3: "SUBJECT", 4: "ROOM", 5: "STUDENT"}
+                self._user_type = type_map.get(elem_type, "TEACHER")
+        
+        self._log(u"User: ID=%s, Type=%s" % (self._user_id, self._user_type))
+        
+        master_data = user_data.get("masterData", {})
+        
+        # Teachers
+        for t in master_data.get("teachers", []):
+            self._cache['teachers'][t['id']] = t.get('name', t.get('longName', '?'))
+        
+        # Subjects
+        for s in master_data.get("subjects", []):
+            self._cache['subjects'][s['id']] = s.get('name', s.get('longName', '?'))
+        
+        # Rooms
+        for r in master_data.get("rooms", []):
+            self._cache['rooms'][r['id']] = r.get('name', r.get('longName', '?'))
+        
+        # Classes (klassen)
+        for k in master_data.get("klassen", []):
+            self._cache['classes'][k['id']] = k.get('name', '?')
+        
+        # Absence reasons
+        self._cache['absence_reasons'] = master_data.get("absenceReasons", [])
+        self._cache['event_reasons'] = master_data.get("eventReasons", [])
+        self._cache['default_absence_reason_id'] = master_data.get("defaultAbsenceReasonId")
+        self._cache['default_lateness_reason_id'] = master_data.get("defaultLatenessReasonId")
+        
+        self._log(u"Cache: %d teachers, %d classes, %d subjects, %d absence reasons" % 
+                  (len(self._cache['teachers']), len(self._cache['classes']), 
+                   len(self._cache['subjects']), len(self._cache['absence_reasons'])))
+    
+    # ==================== Login/Logout ====================
+    
+    @Slot(result=bool)
+    def autoLogin(self):
+        if not self._load_credentials():
+            return False
+        
+        self._log(u"Auto-login: %s @ %s" % (self._username, self._server))
+        
+        result = self._mobile_call("getUserData2017")
+        
+        if "error" not in result and "result" in result:
+            self._process_user_data(result["result"])
+            self._logged_in = True
+            self.loginSuccess.emit(self._username)
+            return True
+        
+        return False
+    
+    # Mindestlaenge: mit 2 Zeichen antwortet die Schulsuche fast immer mit
+    # -6003 ("too many results"), das sah nach einem Fehler aus.
+    MIN_SCHOOL_QUERY = 3
+
+    # Fehlercodes der Schulsuche in Klartext
+    SEARCH_ERRORS = {
+        -6003: u"Zu viele Treffer - bitte genauer eingeben",
+    }
+
+    @Slot(unicode)
+    def searchSchools(self, query):
+        def worker():
+            try:
+                url = "https://schoolsearch.webuntis.com/schoolquery2"
+                payload = {
+                    "id": "wu_schulsuche-%d" % int(time.time()),
+                    "method": "searchSchool",
+                    "params": [{"search": query}],
+                    "jsonrpc": "2.0"
+                }
+                
+                result = self._http_request("POST", url, payload, {"Content-Type": "application/json"})
+                
+                error = result.get("error") if isinstance(result, dict) else None
+                if error:
+                    code = error.get("code")
+                    message = self.SEARCH_ERRORS.get(code) or error.get("message") or u"Unbekannter Fehler"
+                    self._log(u"Schulsuche '%s': Fehler %s (%s)" % (query, code, error.get("message")))
+                    self._search_result = json.dumps({'error': message})
+                    return
+                
+                schools = (result.get("result") or {}).get("schools") or []
+                self._log(u"Schulsuche '%s': %d Ergebnisse" % (query, len(schools)))
+                formatted = []
+                for s in schools[:20]:
+                    server = s.get('server', '')
+                    login_name = s.get('loginName', '')
+                    if not server or not login_name:
+                        continue
+                    formatted.append({
+                        'displayName': s.get('displayName', '') or login_name,
+                        'address': s.get('address', ''),
+                        'server': server,
+                        'loginName': login_name
+                    })
+                self._search_result = json.dumps({'schools': formatted})
+            except Exception as e:
+                self._search_result = json.dumps({'error': u'Schulsuche nicht erreichbar: %s' % unicode(e)})
+        
+        query = (query or u"").strip()
+        if len(query) < self.MIN_SCHOOL_QUERY:
+            self._search_result = json.dumps(
+                {'error': u'Suchbegriff zu kurz (min. %d Zeichen)' % self.MIN_SCHOOL_QUERY})
+            self.schoolsFound.emit(self._search_result)
+            return
+        
+        self._search_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_search_result', self.schoolsFound)
+    
+    @Slot(unicode, unicode, result=unicode)
+    def parseSchoolUrl(self, text, loginName):
+        """
+        Server und Schulkennung aus einer von Hand eingetippten WebUntis-Adresse
+        holen - der Rueckfall, wenn die Schulsuche nichts findet.
+        Versteht z.B.
+          https://melpomene.webuntis.com/WebUntis/?school=meineschule
+          melpomene.webuntis.com/WebUntis/index.do#/basic/login?school=abc
+          melpomene.webuntis.com            (dann muss loginName dabei sein)
+        """
+        text = (text or u"").strip()
+        login_name = (loginName or u"").strip()
+        
+        if not text:
+            return json.dumps({'error': u'Bitte die WebUntis-Adresse eintragen'})
+        
+        raw = text if '//' in text else u'https://' + text
+        try:
+            server = (urlparse.urlsplit(raw).hostname or u'').strip().lower()
+        except Exception:
+            server = u''
+        
+        if not server or '.' not in server:
+            return json.dumps({'error': u'Das sieht nicht nach einer Adresse aus (z.B. xyz.webuntis.com)'})
+        
+        if not login_name:
+            found = re.search(r'school=([^&#/?]+)', raw, re.IGNORECASE)
+            if found:
+                login_name = urlparse.unquote(found.group(1)).strip()
+        
+        if not login_name:
+            return json.dumps({'error': u'Schulkennung fehlt - sie steht in der Adresse als school=...'})
+        
+        self.setSchool(server, login_name)
+        return json.dumps({'server': server, 'loginName': login_name})
+    
+    @Slot(unicode, unicode)
+    def setSchool(self, server, loginName):
+        self._server = server
+        self._school = loginName
+        self._log(u"School set: %s @ %s" % (loginName, server))
+    
+    @Slot(unicode, unicode, bool)
+    def login(self, username, secret, save):
+        def worker():
+            self._username = username
+            self._secret = secret
+            
+            self._log(u"Login attempt: %s" % username)
+            
+            result = self._mobile_call("getUserData2017")
+            
+            if "error" in result:
+                error_msg = result.get("error", {}).get("message", "Login fehlgeschlagen")
+                self._login_result = json.dumps({'success': False, 'error': error_msg})
+                return
+            
+            if "result" not in result:
+                self._login_result = json.dumps({'success': False, 'error': 'Keine Daten erhalten'})
+                return
+            
+            self._process_user_data(result["result"])
+            self._logged_in = True
+            
+            if save:
+                self._save_credentials()
+            
+            self._login_result = json.dumps({'success': True})
+        
+        self._login_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        
+        # Wieder ohne singleShot - siehe _async_check
+        if self._async_timers is None:
+            self._async_timers = []
+
+        timer = QTimer(self)
+        timer.setInterval(100)
+        keep = []
+
+        def finish(error):
+            timer.stop()
+            try:
+                self._async_timers.remove(keep)
+            except ValueError:
+                pass
+            if error:
+                self.loginFailed.emit(error)
+            else:
+                self.loginSuccess.emit(self._username)
+
+        def check():
+            if self._login_result:
+                result = json.loads(self._login_result)
+                if result.get('success'):
+                    finish(None)
+                else:
+                    finish(result.get('error', u'Login fehlgeschlagen'))
+            elif not t.is_alive():
+                finish(u"Zeitüberschreitung")
+
+        keep.extend([timer, check, finish])
+        self._async_timers.append(keep)
+        timer.timeout.connect(check)
+        timer.start()
+    
+    @Slot()
+    def logout(self):
+        self._delete_credentials()
+        self._logged_in = False
+        self._username = ""
+        self._secret = ""
+        self.loggedOut.emit()
+    
+    # ==================== Async Helper ====================
+    
+    _async_timers = None
+
+    def _retry_fetch_avatar(self, studentId, imageUrl):
+        """Spaeter nochmal versuchen - mit festem Timer, nicht per singleShot"""
+        if self._async_timers is None:
+            self._async_timers = []
+        timer = QTimer(self)
+        timer.setInterval(1000)
+        timer.setSingleShot(True)
+        keep = []
+
+        def again():
+            try:
+                self._async_timers.remove(keep)
+            except ValueError:
+                pass
+            self.fetchAvatar(studentId, imageUrl)
+
+        keep.extend([timer, again])
+        self._async_timers.append(keep)
+        timer.timeout.connect(again)
+        timer.start()
+
+
+    def _async_check(self, thread, result_attr, signal, error_msg='Anfrage fehlgeschlagen'):
+        """
+        Auf das Ergebnis eines Hintergrundfadens warten.
+
+        Nicht mit QTimer.singleShot: PySide haelt die uebergebene Funktion
+        nicht fest, sie verschwindet mitten im Lauf und das Ergebnis kommt
+        dann nie an - die Oberflaeche dreht ewig weiter. Darum ein echter
+        QTimer, der zusammen mit seinem Rueckruf am Objekt haengt.
+        """
+        if self._async_timers is None:
+            self._async_timers = []
+
+        timer = QTimer(self)
+        timer.setInterval(100)
+        keep = []
+
+        def done(payload):
+            timer.stop()
+            try:
+                self._async_timers.remove(keep)
+            except ValueError:
+                pass
+            signal.emit(payload)
+
+        def check():
+            result = getattr(self, result_attr, None)
+            if result:
+                done(result)
+            elif not thread.is_alive():
+                done(json.dumps({'error': error_msg}))
+
+        keep.extend([timer, check, done])
+        self._async_timers.append(keep)
+        timer.timeout.connect(check)
+        timer.start()
+    
+    # ==================== Timetable ====================
+    
+    @Slot(unicode, unicode)
+    def getTimetable(self, startDate, endDate):
+        """Get own timetable using Legacy JSON-RPC API (like Sailfish app)"""
+        type_map = {"CLASS": 1, "TEACHER": 2, "SUBJECT": 3, "ROOM": 4, "STUDENT": 5}
+        elem_type = type_map.get(self._user_type, 2)
+        self._get_timetable_jsonrpc(elem_type, self._user_id, startDate, endDate)
+    
+    @Slot(unicode, int, unicode, unicode)
+    def getTimetableFor(self, entityType, entityId, startDate, endDate):
+        """Get timetable for specific entity (class/teacher/room)"""
+        self._log(u"getTimetableFor called: type=%s, id=%s, %s-%s" % (entityType, entityId, startDate, endDate))
+        type_map = {"CLASS": 1, "TEACHER": 2, "SUBJECT": 3, "ROOM": 4, "STUDENT": 5}
+        elem_type = type_map.get(unicode(entityType).upper(), 1)
+        self._log(u"Mapped to elem_type=%d" % elem_type)
+        self._get_timetable_jsonrpc(elem_type, int(entityId), startDate, endDate)
+    
+    def _get_timetable_jsonrpc(self, elem_type, elem_id, startDate, endDate):
+        """Get timetable using standard jsonrpc.do API (this works!)"""
+        def worker():
+            try:
+                # Convert YYYY-MM-DD to integer YYYYMMDD
+                start_int = int(startDate.replace("-", ""))
+                end_int = int(endDate.replace("-", ""))
+                
+                self._log(u"jsonrpc.do getTimetable: type=%d, id=%s, %d-%d" % (elem_type, elem_id, start_int, end_int))
+                
+                # Use standard JSON-RPC API (not mobile API)
+                url = "https://%s/WebUntis/jsonrpc.do?school=%s" % (self._server, self._school)
+                
+                payload = {
+                    "id": "1",
+                    "method": "getTimetable",
+                    "params": {
+                        "startDate": start_int,
+                        "endDate": end_int,
+                        "id": elem_id,
+                        "type": elem_type
+                    },
+                    "jsonrpc": "2.0"
+                }
+                
+                result = self._http_request("POST", url, payload, {"Content-Type": "application/json"})
+                
+                self._log(u"jsonrpc.do result keys: %s" % unicode(result.keys() if isinstance(result, dict) else type(result).__name__))
+                
+                if "error" in result:
+                    error_msg = result.get('error', {})
+                    if isinstance(error_msg, dict):
+                        error_msg = error_msg.get('message', unicode(error_msg))
+                    self._log(u"getTimetable error: %s" % error_msg)
+                    self._timetable_result = json.dumps({'error': unicode(error_msg)})
+                    return
+                
+                periods_raw = result.get("result", [])
+                self._log(u"Found %d periods" % len(periods_raw))
+                
+                if periods_raw and len(periods_raw) > 0:
+                    self._log(u"First period: %s" % unicode(periods_raw[0])[:300])
+                
+                # Convert to our format
+                lessons = []
+                for p in periods_raw:
+                    if not isinstance(p, dict):
+                        continue
+                    
+                    lstype = p.get('lstype', '')
+                    
+                    # Determine activity type
+                    if lstype == 'bs':
+                        activity = 'Bereitschaft'
+                    elif lstype == 'oh':
+                        activity = 'Gangaufsicht'
+                    else:
+                        activity = p.get('activityType', 'Unterricht')
+                    
+                    # Extract names from cache
+                    classes = []
+                    for k in p.get('kl', []):
+                        if isinstance(k, dict):
+                            classes.append(self._cache['classes'].get(k.get('id'), 'K%s' % k.get('id')))
+                    
+                    subjects = []
+                    for s in p.get('su', []):
+                        if isinstance(s, dict):
+                            subjects.append(self._cache['subjects'].get(s.get('id'), 'S%s' % s.get('id')))
+                    
+                    teachers = []
+                    for t in p.get('te', []):
+                        if isinstance(t, dict):
+                            teachers.append(self._cache['teachers'].get(t.get('id'), 'T%s' % t.get('id')))
+                    
+                    rooms = []
+                    for r in p.get('ro', []):
+                        if isinstance(r, dict):
+                            rooms.append(self._cache['rooms'].get(r.get('id'), 'R%s' % r.get('id')))
+                    
+                    # Use activity as subject if no subjects
+                    if not subjects and lstype:
+                        subjects = [activity]
+                    
+                    lesson = {
+                        'id': p.get('id'),
+                        'date': p.get('date'),
+                        'startTime': p.get('startTime'),
+                        'endTime': p.get('endTime'),
+                        'classes': classes,
+                        'subjects': subjects,
+                        'teachers': teachers,
+                        'rooms': rooms,
+                        'code': p.get('code', ''),
+                        'cellState': p.get('cellState', 'STANDARD'),
+                        'activityType': activity,
+                        'lstype': lstype,
+                        'text': p.get('lstext', '')
+                    }
+                    lessons.append(lesson)
+                
+                # Sort by date and time
+                lessons.sort(key=lambda l: (l.get('date', 0), l.get('startTime', 0)))
+                self._log(u"Parsed %d lessons" % len(lessons))
+                
+                self._timetable_result = json.dumps({'lessons': lessons})
+                
+            except Exception as e:
+                import traceback
+                self._log(u"Timetable ERROR: %s" % unicode(e))
+                self._log(u"Traceback: %s" % traceback.format_exc())
+                self._timetable_result = json.dumps({'error': unicode(e)})
+        
+        self._timetable_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_timetable_result', self.timetableReady)
+    
+    # ==================== Period Data ====================
+    
+    @Slot(int)
+    def getPeriodData(self, periodId):
+        """Get detailed period data with students and absences"""
+        def worker():
+            try:
+                self._log(u"getPeriodData2017 for period %d" % periodId)
+                result = self._mobile_call("getPeriodData2017", {"ttIds": [periodId]})
+                
+                if "error" in result:
+                    self._period_result = json.dumps({'error': result.get('error', {}).get('message', 'Fehler')})
+                    return
+                
+                if "result" not in result:
+                    self._period_result = json.dumps({'error': 'Keine Daten'})
+                    return
+                
+                data = result["result"]
+                data_by_tt = data.get("dataByTTId", {})
+                period_data = data_by_tt.get(str(periodId), {})
+                
+                # Students
+                students = []
+                for s in data.get("referencedStudents", []):
+                    students.append({
+                        'studId': s.get('id'),
+                        'firstName': s.get('foreName', s.get('firstName', '')),
+                        'lastName': s.get('longName', s.get('lastName', '')),
+                        'className': s.get('className', ''),
+                        'imageUrl': s.get('imageUrl', ''),
+                    })
+                
+                if not students:
+                    for s in period_data.get("students", []):
+                        students.append({
+                            'studId': s.get('id'),
+                            'firstName': s.get('firstName', ''),
+                            'lastName': s.get('lastName', ''),
+                            'className': s.get('className', ''),
+                            'imageUrl': s.get('imageUrl', ''),
+                        })
+                
+                students.sort(key=lambda x: (x.get('lastName', ''), x.get('firstName', '')))
+                
+                # Absences
+                absences = []
+                for a in (period_data.get("absences") or []):
+                    absences.append({
+                        'id': a.get('id'),
+                        'studentId': a.get('studentId'),
+                        'reasonId': a.get('reasonId'),
+                        'startTime': a.get('startTime'),
+                        'endTime': a.get('endTime'),
+                        'text': a.get('text', ''),
+                        'isLateness': a.get('isLateness', False),
+                    })
+                
+                # Class register events
+                classreg_events = []
+                for e in (period_data.get("classRegEvents") or []):
+                    classreg_events.append({
+                        'id': e.get('id'),
+                        'elementType': e.get('elementType', ''),
+                        'elementId': e.get('elementId'),
+                        'reasonId': e.get('eventReasonId'),
+                        'text': e.get('text', ''),
+                    })
+                
+                # Topic, homework, notes
+                topic = period_data.get('topic', {}) or {}
+                text_data = period_data.get('text') or {}
+                
+                result_data = {
+                    'ttId': period_data.get('ttId'),
+                    'students': students,
+                    'absences': absences,
+                    'classRegEvents': classreg_events,
+                    'topic': topic,
+                    'homeworks': period_data.get('homeWorks') or [],
+                    'can': period_data.get('can', []) or [],
+                    'notesAll': text_data.get('info', ''),
+                    'notesStaff': text_data.get('staffInfo', ''),
+                    'startDateTime': topic.get('startDateTime', ''),
+                    'endDateTime': topic.get('endDateTime', ''),
+                }
+                
+                self._log(u"Period: %d students, %d absences" % (len(students), len(absences)))
+                self._period_result = json.dumps(result_data)
+                
+            except Exception as e:
+                self._log(u"Period error: %s" % unicode(e))
+                self._period_result = json.dumps({'error': unicode(e)})
+        
+        self._period_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_period_result', self.periodDataReady)
+    
+    @Slot(int)
+    def getNotesData(self, periodId):
+        """Get notes data for a period"""
+        def worker():
+            try:
+                result = self._mobile_call("getPeriodData2017", {"ttIds": [periodId]})
+                
+                if "error" in result:
+                    self._notes_result = json.dumps({'error': result.get('error', {}).get('message', 'Fehler')})
+                    return
+                
+                data = result.get("result", {})
+                period_data = data.get("dataByTTId", {}).get(str(periodId), {})
+                text_data = period_data.get('text') or {}
+                
+                self._notes_result = json.dumps({
+                    'info': text_data.get('info', ''),
+                    'staffInfo': text_data.get('staffInfo', ''),
+                })
+                
+            except Exception as e:
+                self._notes_result = json.dumps({'error': unicode(e)})
+        
+        self._notes_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_notes_result', self.notesDataReady)
+    
+    @Slot(int)
+    def getHomeworkData(self, periodId):
+        """Get homework data for a period"""
+        def worker():
+            try:
+                result = self._mobile_call("getPeriodData2017", {"ttIds": [periodId]})
+                
+                if "error" in result:
+                    self._homework_result = json.dumps({'error': result.get('error', {}).get('message', 'Fehler')})
+                    return
+                
+                data = result.get("result", {})
+                period_data = data.get("dataByTTId", {}).get(str(periodId), {})
+                
+                homework = []
+                for hw in (period_data.get('homeWorks') or []):
+                    homework.append({
+                        'id': hw.get('id'),
+                        'text': hw.get('text', ''),
+                        'dueDate': hw.get('dueDate', ''),
+                        'remark': hw.get('remark', ''),
+                    })
+                
+                self._homework_result = json.dumps({'homework': homework})
+                
+            except Exception as e:
+                self._homework_result = json.dumps({'error': unicode(e)})
+        
+        self._homework_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_homework_result', self.homeworkDataReady)
+    
+    @Slot(int)
+    def getClassRegData(self, periodId):
+        """Get class register data for a period"""
+        def worker():
+            try:
+                result = self._mobile_call("getPeriodData2017", {"ttIds": [periodId]})
+                
+                if "error" in result:
+                    self._classreg_result = json.dumps({'error': result.get('error', {}).get('message', 'Fehler')})
+                    return
+                
+                data = result.get("result", {})
+                period_data = data.get("dataByTTId", {}).get(str(periodId), {})
+                
+                events = []
+                for e in (period_data.get("classRegEvents") or []):
+                    # Get reason name
+                    reason_name = ""
+                    reason_id = e.get('eventReasonId')
+                    if reason_id:
+                        for r in self._cache.get('event_reasons', []):
+                            if r.get('id') == reason_id:
+                                reason_name = r.get('name', r.get('longName', ''))
+                                break
+                    
+                    events.append({
+                        'id': e.get('id'),
+                        'elementType': e.get('elementType', ''),
+                        'elementId': e.get('elementId'),
+                        'reasonId': reason_id,
+                        'reasonName': reason_name,
+                        'text': e.get('text', ''),
+                        'studentName': e.get('studentName', ''),
+                    })
+                
+                self._classreg_result = json.dumps({
+                    'events': events,
+                    'eventReasons': self._cache.get('event_reasons', []),
+                })
+                
+            except Exception as e:
+                self._classreg_result = json.dumps({'error': unicode(e)})
+        
+        self._classreg_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_classreg_result', self.classRegDataReady)
+    
+    # ==================== Absences ====================
+    
+    @Slot(result=unicode)
+    def getAbsenceReasons(self):
+        return json.dumps(self._cache.get('absence_reasons', []))
+    
+    @Slot(int, int, int, unicode)
+    def createAbsence(self, periodId, studentId, reasonId, text):
+        """Create absence using createAbsences2017 (like Sailfish app)"""
+        def worker():
+            try:
+                # Validate reason
+                valid_reasons = [r.get('id') for r in self._cache.get('absence_reasons', []) if r.get('id')]
+                if not reasonId or reasonId not in valid_reasons:
+                    if 2 in valid_reasons:
+                        reason = 2
+                    elif self._cache.get('default_absence_reason_id'):
+                        reason = self._cache.get('default_absence_reason_id')
+                    elif valid_reasons:
+                        reason = valid_reasons[0]
+                    else:
+                        reason = 2
+                else:
+                    reason = reasonId
+                
+                # Get period times first
+                period_check = self._mobile_call("getPeriodData2017", {"ttIds": [periodId]})
+                if "error" in period_check or "result" not in period_check:
+                    self._op_result = json.dumps({'success': False, 'error': 'Periode nicht gefunden'})
+                    return
+                
+                data = period_check["result"]
+                period_data = data.get("dataByTTId", {}).get(str(periodId), {})
+                topic = period_data.get("topic", {}) or {}
+                start_dt = topic.get("startDateTime", "")
+                end_dt = topic.get("endDateTime", "")
+                
+                if not start_dt or not end_dt:
+                    self._op_result = json.dumps({'success': False, 'error': 'Stundenzeiten nicht verfügbar'})
+                    return
+                
+                params = {
+                    "periodId": periodId,
+                    "studentIds": [studentId],
+                    "absenceReasonId": reason,
+                    "startDateTime": start_dt,
+                    "endDateTime": end_dt
+                }
+                if text and text.strip():
+                    params["text"] = text.strip()
+                
+                result = self._mobile_call("createAbsences2017", params)
+                
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+                    
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    @Slot(int)
+    def deleteAbsence(self, absenceId):
+        def worker():
+            try:
+                result = self._mobile_call("deleteAbsence2017", {"absenceId": absenceId})
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    @Slot(int, int, int)
+    def createLateness(self, periodId, studentId, reasonId):
+        """Create lateness for student"""
+        def worker():
+            try:
+                reason = reasonId if reasonId else self._cache.get('default_lateness_reason_id', 1)
+                
+                params = {
+                    "ttId": periodId,
+                    "studentId": studentId,
+                    "reasonId": reason,
+                    "isLateness": True,
+                    "text": " "
+                }
+                
+                result = self._mobile_call("createImmediateAbsence2017", params)
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    # ==================== Topic & Notes ====================
+    
+    @Slot(int, unicode)
+    def submitTopic(self, periodId, text):
+        self._log(u"submitTopic called: periodId=%s, text=%s" % (periodId, text[:50] if text else ""))
+        def worker():
+            try:
+                self._log(u"submitTopic worker starting")
+                # Use submitLessonTopic (not 2017) with ttId (not ttIds)
+                result = self._mobile_call("submitLessonTopic", {"ttId": periodId, "lessonTopic": text})
+                self._log(u"submitTopic result: %s" % unicode(result)[:200])
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+            except Exception as e:
+                self._log(u"submitTopic error: %s" % unicode(e))
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    @Slot(int, unicode, unicode)
+    def submitPeriodInfo(self, periodId, infoType, text):
+        """Submit notes (notesAll or notesStaff)"""
+        def worker():
+            try:
+                params = {"ttId": periodId}
+                if infoType == "notesAll":
+                    params["info"] = text
+                elif infoType == "notesStaff":
+                    params["staffInfo"] = text
+                
+                result = self._mobile_call("submitLessonText2017", params)
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    # ==================== Homework ====================
+    
+    @Slot(int, unicode, unicode, unicode, int)
+    def submitHomework(self, periodId, text, dueDate, remark, homeworkId):
+        def worker():
+            try:
+                params = {"ttId": periodId, "text": text}
+                if dueDate:
+                    params["date"] = dueDate
+                if remark:
+                    params["remark"] = remark
+                if homeworkId > 0:
+                    params["id"] = homeworkId
+                
+                result = self._mobile_call("submitHomeWork2017", params)
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    @Slot(int)
+    def deleteHomework(self, homeworkId):
+        def worker():
+            try:
+                result = self._mobile_call("deleteHomeWork2017", {"id": homeworkId})
+                if "error" in result:
+                    self._op_result = json.dumps({'success': False, 'error': result['error'].get('message', 'Fehler')})
+                else:
+                    self._op_result = json.dumps({'success': True})
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    # ==================== Class Register Events ====================
+    
+    @Slot(result=unicode)
+    def getEventReasons(self):
+        return json.dumps(self._cache.get('event_reasons', []))
+    
+    @Slot(int, unicode, int, unicode, unicode)
+    def submitClassRegEvent(self, periodId, elementIds, reasonId, text, elementType):
+        """Submit class register event"""
+        def worker():
+            try:
+                # Parse element IDs
+                ids = [int(x.strip()) for x in elementIds.split(',') if x.strip()]
+                if not ids:
+                    self._op_result = json.dumps({'success': False, 'error': 'Keine Elemente ausgewählt'})
+                    return
+                
+                if not text or not text.strip():
+                    self._op_result = json.dumps({'success': False, 'error': 'Bitte Text eingeben'})
+                    return
+                
+                type_map = {"STUDENT": 5, "CLASS": 1, "KLASSE": 1, "TEACHER": 2}
+                elem_type_num = type_map.get(elementType.upper(), 5)
+                reason_val = reasonId if reasonId and reasonId > 0 else -1
+                
+                now = datetime.now()
+                date_str = now.strftime("%Y-%m-%d")
+                time_str = now.strftime("%H:%M")
+                
+                success_count = 0
+                for elem_id in ids:
+                    params = {
+                        "ttId": periodId,
+                        "event": {
+                            "id": 0,
+                            "date": date_str,
+                            "startTime": time_str,
+                            "text": text.strip(),
+                            "reasonId": reason_val,
+                            "element": {"type": elem_type_num, "id": elem_id}
+                        }
+                    }
+                    
+                    result = self._mobile_call("submitClassRegEvents", params)
+                    if "error" not in result:
+                        success_count += 1
+                
+                if success_count > 0:
+                    self._op_result = json.dumps({'success': True, 'count': success_count})
+                else:
+                    self._op_result = json.dumps({'success': False, 'error': 'Eintrag konnte nicht erstellt werden'})
+                    
+            except Exception as e:
+                self._op_result = json.dumps({'success': False, 'error': unicode(e)})
+        
+        self._op_result = None
+        t = threading.Thread(target=worker)
+        t.start()
+        self._async_check(t, '_op_result', self.operationResult)
+    
+    # ==================== Lists ====================
+    
+    @Slot()
+    def getClassesList(self):
+        classes = [{'id': int(cid), 'name': cdata if isinstance(cdata, (str, unicode)) else cdata.get('name', '')} 
+                   for cid, cdata in self._cache['classes'].items()]
+        classes.sort(key=lambda x: x.get('name', ''))
+        self._log(u"Classes list: %d items" % len(classes))
+        self.classesReady.emit(json.dumps(classes))
+    
+    @Slot()
+    def getTeachersList(self):
+        teachers = [{'id': int(tid), 'name': tdata if isinstance(tdata, (str, unicode)) else tdata.get('name', '')} 
+                    for tid, tdata in self._cache['teachers'].items()]
+        teachers.sort(key=lambda x: x.get('name', ''))
+        self._log(u"Teachers list: %d items" % len(teachers))
+        self.teachersReady.emit(json.dumps(teachers))
+    
+    @Slot()
+    def getRoomsList(self):
+        rooms = [{'id': int(rid), 'name': rdata if isinstance(rdata, (str, unicode)) else rdata.get('name', '')} 
+                 for rid, rdata in self._cache['rooms'].items()]
+        rooms.sort(key=lambda x: x.get('name', ''))
+        self._log(u"Rooms list: %d items" % len(rooms))
+        self.roomsReady.emit(json.dumps(rooms))
+    
+    # ==================== Avatars ====================
+    
+    @Slot(int, result=unicode)
+    def getAvatarPath(self, studentId):
+        """Get local path for avatar if it exists"""
+        ensure_avatar_dir()
+        path = os.path.join(AVATAR_CACHE_DIR, "%d.jpg" % studentId)
+        if os.path.exists(path):
+            return "file://" + path
+        return ""
+    
+    @Slot(int, unicode)
+    def fetchAvatar(self, studentId, imageUrl):
+        """Download and cache avatar image for next time"""
+        if not imageUrl or studentId in self._avatar_loading:
+            return
+        
+        # Check if already cached
+        ensure_avatar_dir()
+        local_path = os.path.join(AVATAR_CACHE_DIR, "%d.jpg" % studentId)
+        if os.path.exists(local_path):
+            return  # Already have it
+        
+        # Limit concurrent downloads to 1
+        if len(self._avatar_loading) >= 1:
+            # Queue for later
+            self._retry_fetch_avatar(studentId, imageUrl)
+            return
+        
+        self._avatar_loading.add(studentId)
+        self._log(u"Fetching avatar for student %d" % studentId)
+        
+        def worker():
+            try:
+                # Build full URL if relative
+                if imageUrl.startswith('/'):
+                    url = "https://%s%s" % (self._server, imageUrl)
+                elif not imageUrl.startswith('http'):
+                    url = "https://%s/WebUntis/%s" % (self._server, imageUrl)
+                else:
+                    url = imageUrl
+                
+                # Download image using image_helper
+                image_helper = "/opt/webuntis/image_helper.py"
+                cmd = [image_helper, url, local_path]
+                
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                out, err = proc.communicate()
+                
+                if proc.returncode == 0 and os.path.exists(local_path):
+                    self._log(u"Avatar saved: %d" % studentId)
+                    
+            except Exception as e:
+                self._log(u"Avatar error: %s" % unicode(e))
+            finally:
+                self._avatar_loading.discard(studentId)
+        
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+
+
+def main():
+    print u"=== WebUntis %s for MeeGo Harmattan ===" % VERSION
+    
+    app = QApplication(sys.argv)
+    
+    backend = WebUntisBackend()
+    
+    view = QDeclarativeView()
+    view.setResizeMode(QDeclarativeView.SizeRootObjectToView)
+    
+    engine = view.engine()
+    engine.addImportPath("/usr/lib/qt4/imports")
+    engine.addImportPath("/usr/share/qt4/imports")
+    
+    view.rootContext().setContextProperty("backend", backend)
+    view.setSource(QUrl.fromLocalFile("/opt/webuntis/qml/main.qml"))
+    
+    if view.status() == QDeclarativeView.Error:
+        for error in view.errors():
+            print u"QML Error:", error.toString()
+        return 1
+    
+    view.showFullScreen()
+    
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

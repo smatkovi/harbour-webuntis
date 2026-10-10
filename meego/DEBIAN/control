@@ -1,0 +1,20 @@
+Package: webuntis
+Version: 1.5.3
+Section: user/education
+Priority: optional
+Architecture: all
+Depends: python, python-pyside.qtcore, python-pyside.qtgui, python-pyside.qtdeclarative
+Maintainer: smatkovi <smatkovi@users.noreply.github.com>
+Description: WebUntis Klassenbuch für MeeGo Harmattan
+ Inoffizieller WebUntis Client für MeeGo Harmattan PR1.3.
+ Portiert von Sailfish OS harbour-webuntis.
+ .
+ Features:
+ - Schulsuche
+ - Login mit TOTP/Secret (für Microsoft 365 Schulen)
+ - Stundenplan anzeigen
+ - Stundendetails und Schülerliste
+ - Abwesenheiten verwalten
+XB-Maemo-Display-Name: WebUntis
+XB-Maemo-Icon-26: /opt/webuntis/icons/webuntis.png
+XSBC-Bugtracker: https://github.com/smatkovi/harbour-webuntis

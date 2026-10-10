@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WebUntis
+Comment=WebUntis Klassenbuch
+Comment[de]=WebUntis Klassenbuch für Lehrer
+Icon=/usr/share/icons/hicolor/80x80/apps/webuntis.png
+Exec=/opt/webuntis/webuntis
+Terminal=false
+Categories=Education;Office;
+X-MeeGo-Logical-Id=webuntis
+X-MeeGo-Translation-Catalog=webuntis
+X-MeeGo-Touch-Icon=/opt/webuntis/icons/webuntis.png

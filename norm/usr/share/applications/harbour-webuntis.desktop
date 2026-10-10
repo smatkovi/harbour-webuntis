@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WebUntis
+Comment=WebUntis Klassenbuch für Sailfish OS
+Icon=harbour-webuntis
+Exec=sailfish-qml harbour-webuntis
+X-Nemo-Application-Type=silica-qt5
+
+[X-Sailjail]
+Permissions=Internet;Secrets;
+OrganizationName=harbour-webuntis
+ApplicationName=harbour-webuntis
