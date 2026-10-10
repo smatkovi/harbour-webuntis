@@ -59,6 +59,14 @@ starten):
 sudo aegis-dpkg -i webuntis_1.5.3_all.deb
 ```
 
+Das Harmattan-Paket spricht HTTPS nicht selbst: `http_helper.py` läuft unter
+`/opt/wunderw/bin/python3.11`, einem von Hand nachinstallierten Python 3.11.
+Harmattans eigenes Python 2.6 kommt an den heutigen TLS-Stand nicht heran. Ohne
+dieses Python meldet jede Anfrage „Schulsuche nicht erreichbar"; das steht
+absichtlich nicht in `Depends:`, weil es kein Paket aus einem Repo ist.
+Der Helfer prüft das Serverzertifikat nicht (`CERT_NONE`) – Harmattans
+Zertifikatsspeicher ist zu alt dafür.
+
 ## Bauen
 
 Kein SDK nötig, beides läuft am Gerät:
