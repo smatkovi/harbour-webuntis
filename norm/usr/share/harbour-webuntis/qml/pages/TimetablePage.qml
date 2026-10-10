@@ -9,6 +9,7 @@ Page {
     property var lessons: []
     property string viewMode: "today"  // "today" oder "week"
     property int weekOffset: 0  // 0 = aktuelle Woche, -1 = letzte Woche, +1 = nächste Woche
+    property string errorMessage: ""   // kurze Meldung über der Liste
     
     // Wait for login before loading
     Component.onCompleted: {
@@ -29,6 +30,39 @@ Page {
         }
     }
     
+    // Kurze Meldung ueber der Liste, wenn eine Stunde nicht aufgeht
+    Timer {
+        id: errorTimer
+        interval: 7000
+        onTriggered: timetablePage.errorMessage = ""
+    }
+
+    Rectangle {
+        id: errorBanner
+        anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
+        height: errorLabel.height + 2 * Theme.paddingMedium
+        color: Theme.rgba(Theme.highlightDimmerColor, 0.9)
+        visible: timetablePage.errorMessage.length > 0
+        z: 10
+
+        Label {
+            id: errorLabel
+            anchors.centerIn: parent
+            x: Theme.horizontalPageMargin
+            width: parent.width - 2 * Theme.horizontalPageMargin
+            text: timetablePage.errorMessage
+            color: Theme.errorColor
+            font.pixelSize: Theme.fontSizeSmall
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: timetablePage.errorMessage = ""
+        }
+    }
+
     SilicaListView {
         id: lessonList
         anchors.fill: parent
@@ -66,6 +100,10 @@ Page {
                         })
                     })
                 }
+            }
+            MenuItem {
+                text: "Schlüssel nachtragen"
+                onClicked: pageStack.push(Qt.resolvedUrl("SecretPage.qml"))
             }
             MenuItem {
                 text: "Anderen Stundenplan anzeigen"
@@ -326,8 +364,19 @@ Page {
                     periodStartTime: lesson.startTime,
                     periodEndTime: lesson.endTime
                 })
+            } else if (periodData && periodData.needSecret) {
+                // Ohne Schlüssel bleibt das Klassenbuch zu - also gleich
+                // dorthin, wo man ihn nachtragen kann, statt still nichts
+                // zu tun.
+                pageStack.push(Qt.resolvedUrl("SecretPage.qml"), {
+                    hint: "Die Stunde lässt sich nicht öffnen: " + periodData.error
+                })
             } else {
                 console.log("Period data error: " + (periodData ? periodData.error : "no data"))
+                timetablePage.errorMessage = periodData && periodData.error
+                                             ? periodData.error
+                                             : "Die Stunde lässt sich nicht öffnen"
+                errorTimer.restart()
             }
         })
     }

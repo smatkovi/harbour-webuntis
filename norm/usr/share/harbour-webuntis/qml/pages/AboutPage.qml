@@ -35,7 +35,7 @@ Page {
             Label {
                 x: Theme.horizontalPageMargin
                 width: parent.width - 2*x
-                text: "Version 1.8.7"
+                text: "Version 1.8.8"
                 color: Theme.secondaryColor
                 font.pixelSize: Theme.fontSizeSmall
                 horizontalAlignment: Text.AlignHCenter

@@ -98,6 +98,10 @@ ApplicationWindow {
             call('webuntis_classbook.login', [server, school, user, password, secret, save], callback)
         }
         
+        function setSecret(value, callback) {
+            call('webuntis_classbook.set_secret', [value], callback)
+        }
+        
         function doLogout(callback) {
             call('webuntis_classbook.logout', [], callback)
         }

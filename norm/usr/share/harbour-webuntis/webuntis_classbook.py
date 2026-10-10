@@ -4,7 +4,7 @@ WebUntis Klassenbuch Backend für Sailfish OS
 Mit Mobile-API für Anwesenheitserfassung
 """
 
-VERSION = "v1.8.7"
+VERSION = "v1.8.8"
 
 import pyotherside
 import json
@@ -32,6 +32,15 @@ except ImportError:
 # Konfiguration - dynamisch pro Schule
 SERVER = None
 SCHOOL = None
+
+# Ohne Schluessel aus dem QR-Code bleibt das Klassenbuch zu - die
+# Mobile-API will eine Einmalkennung. Der Text sagt, wo der Schluessel steht.
+SECRET_MISSING = ("Dafür fehlt der Schlüssel aus dem QR-Code: "
+                  "WebUntis \u2192 Profil \u2192 Freigaben \u2192 Anzeigen")
+
+# None = noch nicht versucht, True/False = der Server nimmt die Sitzung aus
+# der Passwort-Anmeldung (an)statt der Einmalkennung. Wird nur einmal probiert.
+_session_auth_works = None
 
 # Globaler State
 session = None
@@ -209,22 +218,29 @@ def api_call(method: str, params: dict = None):
 
 
 def mobile_call(method: str, extra_params: dict = None):
-    """Mobile API call with OTP authentication"""
-    global session, username, secret
+    """
+    Aufruf der Mobile-API.
+
+    Normalerweise mit Einmalkennung aus dem Schluessel. Fehlt der Schluessel,
+    wird genau einmal versucht, ob der Server die Sitzung aus der
+    Passwort-Anmeldung annimmt; sagt er nein, kommt der Hinweis, wo der
+    Schluessel steht - und nicht mehr das alte "Mobile API nicht verfuegbar",
+    das niemandem sagte, was zu tun ist.
+    """
+    global session, username, secret, _session_auth_works
     
-    if not session or not secret:
-        raise Exception("Mobile API nicht verfügbar")
+    if not session:
+        raise Exception("Nicht eingeloggt")
     
-    otp = generate_otp(secret)
-    client_time = int(time.time() * 1000)
-    
-    params = {
-        "auth": {
+    params = {}
+    if secret:
+        params["auth"] = {
             "user": username,
-            "otp": int(otp),
-            "clientTime": client_time
+            "otp": int(generate_otp(secret)),
+            "clientTime": int(time.time() * 1000)
         }
-    }
+    elif _session_auth_works is False:
+        raise Exception(SECRET_MISSING)
     
     if extra_params:
         params.update(extra_params)
@@ -236,12 +252,61 @@ def mobile_call(method: str, extra_params: dict = None):
         "jsonrpc": "2.0"
     }
     
-    # Log full request for debugging
-    log(f"mobile_call REQUEST: method={method}, params={params}")
+    # Einmalkennung gehoert nicht ins Journal
+    log(f"mobile_call: {method} params={ {k: v for k, v in params.items() if k != 'auth'} }")
     
     url = f"https://{SERVER}/WebUntis/jsonrpc_intern.do?school={SCHOOL}"
     resp = session.post(url, json=payload, timeout=15)
-    return resp.json()
+    data = resp.json()
+    
+    if not secret:
+        if "error" in data:
+            # Der Weg ueber die Sitzung wird nicht angenommen - nicht
+            # wieder und wieder probieren.
+            _session_auth_works = False
+            log(f"Sitzung statt Einmalkennung abgelehnt: {data['error'].get('message')}")
+            raise Exception(SECRET_MISSING)
+        _session_auth_works = True
+    
+    return data
+
+
+def has_secret():
+    """Ist ein Schluessel aus dem QR-Code hinterlegt?"""
+    return bool(secret)
+
+
+def set_secret(value: str):
+    """
+    Schluessel aus dem QR-Code nachtragen, ohne sich neu anzumelden.
+    Wird erst gegen den Server geprueft und nur dann gespeichert.
+    """
+    global secret, _session_auth_works
+    
+    value = (value or '').strip().replace(' ', '')
+    if len(value) < 16:
+        return {'success': False, 'error': 'Der Schlüssel hat mindestens 16 Zeichen'}
+    if not session:
+        return {'success': False, 'error': 'Nicht angemeldet'}
+    
+    vorher = secret
+    secret = value
+    _session_auth_works = None
+    
+    try:
+        result = mobile_call("getUserData2017")
+    except Exception as e:
+        secret = vorher
+        return {'success': False, 'error': f'Schlüssel abgelehnt: {e}'}
+    
+    if "error" in result:
+        secret = vorher
+        return {'success': False,
+                'error': result['error'].get('message', 'Schlüssel abgelehnt')}
+    
+    save_credentials(SERVER, SCHOOL, username, password, value)
+    log('Schlüssel nachgetragen und gespeichert')
+    return {'success': True}
 
 
 def save_credentials(server: str, school: str, user: str, pwd: str, mobile_secret: str = None):
@@ -305,6 +370,7 @@ def load_credentials():
 def login(server: str, school: str, user: str, pwd: str, mobile_secret: str = None, save: bool = True):
     """Login to WebUntis using JSON-RPC"""
     global session, person_id, person_type, username, password, secret, cache, SERVER, SCHOOL
+    global _session_auth_works
     
     with session_lock:
         try:
@@ -313,6 +379,7 @@ def login(server: str, school: str, user: str, pwd: str, mobile_secret: str = No
             username = user
             password = pwd
             secret = mobile_secret  # Set mobile API secret
+            _session_auth_works = None
             
             session = requests.Session()
             session.headers['User-Agent'] = 'Untis/6.3.2 (Linux; Mobile; SailfishOS)'
@@ -687,7 +754,7 @@ def get_period_data(period_id: int, load_images: bool = False):
             
     except Exception as e:
         log(f"get_period_data exception: {e}")
-        return {'error': str(e)}
+        return {'error': str(e), 'needSecret': not secret}
 
 
 def get_absence_reasons():

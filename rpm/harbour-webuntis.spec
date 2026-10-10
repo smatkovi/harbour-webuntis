@@ -1,6 +1,6 @@
 Name:       harbour-webuntis
 Summary:    WebUntis for Sailfish OS
-Version:    1.8.7
+Version:    1.8.8
 Release:    1
 License:    MIT
 BuildArch:  noarch
@@ -27,6 +27,16 @@ rm -rf %{buildroot}/usr/share/harbour-webuntis/__pycache__
 /usr/share/icons/hicolor/*/apps/harbour-webuntis.png
 
 %changelog
+* Sat Oct 10 2026 Sebastian Matkovich <smatkovi@users.noreply.github.com> - 1.8.8-1
+- Fixed: Antippen einer Stunde tat ohne Schluessel aus dem QR-Code gar
+  nichts - der Fehler ging nur ins Journal. Jetzt fuehrt der Tipp dorthin,
+  wo der Schluessel nachgetragen wird, und die Meldung sagt, wo er steht.
+- Added: "Schluessel nachtragen" im Menue des Stundenplans - ohne neue
+  Anmeldung, wird vor dem Speichern gegen den Server geprueft.
+- Added: Fehlt der Schluessel, wird einmal versucht, ob der Server die
+  Sitzung aus der Passwort-Anmeldung annimmt.
+- Fixed: Die Einmalkennung steht nicht mehr im Journal.
+
 * Sat Oct 10 2026 Sebastian Matkovich <smatkovi@users.noreply.github.com> - 1.8.7-1
 - Fixed: Schulsuche und Anmeldung liefen im Sailjail-Sandkasten nie an,
   weil "import requests" dort scheitert (pip --user ist unsichtbar).

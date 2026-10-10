@@ -36,6 +36,26 @@ Page {
                 visible: isLoading
             }
             
+            // Was nicht geht, soll dastehen - nicht leer bleiben
+            Label {
+                x: Theme.horizontalPageMargin
+                width: parent.width - 2 * Theme.horizontalPageMargin
+                text: periodData && periodData.error ? periodData.error : ""
+                color: Theme.errorColor
+                font.pixelSize: Theme.fontSizeSmall
+                wrapMode: Text.WordWrap
+                visible: text.length > 0
+            }
+
+            Button {
+                text: "Schlüssel nachtragen"
+                anchors.horizontalCenter: parent.horizontalCenter
+                visible: periodData && periodData.needSecret === true
+                onClicked: pageStack.push(Qt.resolvedUrl("SecretPage.qml"), {
+                    hint: periodData.error
+                })
+            }
+
             // Lehrstoff
             SectionHeader {
                 text: "Lehrstoff"
